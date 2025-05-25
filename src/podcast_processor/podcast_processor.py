@@ -59,6 +59,23 @@ class PodcastProcessor:
 
         litellm.api_base = self.config.openai_base_url
         litellm.api_key = self.config.llm_api_key
+        
+        # Configure custom model to avoid "model not mapped" warnings
+        # This tells LiteLLM to treat your custom model as OpenAI-compatible
+        if self.config.llm_model.startswith("openrouter/"):
+            # Register custom model with LiteLLM
+            litellm.model_cost = litellm.model_cost or {}
+            if self.config.llm_model not in litellm.model_cost:
+                litellm.model_cost[self.config.llm_model] = {
+                    "max_tokens": self.config.openai_max_tokens,
+                    "input_cost_per_token": 0.0,  # Free model
+                    "output_cost_per_token": 0.0,  # Free model
+                    "litellm_provider": "openai",  # Treat as OpenAI-compatible
+                    "mode": "chat"
+                }
+        
+        # Suppress LiteLLM debug warnings for unknown models
+        litellm.suppress_debug_info = True
 
         # Initialize components with default implementations if not provided
         if transcription_manager is None:
