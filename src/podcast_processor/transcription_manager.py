@@ -1,5 +1,8 @@
 import logging
+from datetime import datetime
 from typing import Any, List, Optional
+
+from sqlalchemy.exc import IntegrityError
 
 from app import db
 from app.models import ModelCall, Post, TranscriptSegment
@@ -60,6 +63,7 @@ class TranscriptionManager:
         self, post: Post
     ) -> Optional[List[TranscriptSegment]]:
         """Checks for existing successful transcription and returns segments if valid."""
+        # First check for successful transcription
         existing_whisper_call = (
             self.model_call_query.filter_by(
                 post_id=post.id,
@@ -97,8 +101,47 @@ class TranscriptionManager:
                 )
         else:
             self.logger.info(
-                f"No existing successful Whisper ModelCall found for post {post.id} with model {self.transcriber.model_name}. Proceeding to transcribe."
+                f"No existing successful Whisper ModelCall found for post {post.id} with model {self.transcriber.model_name}."
             )
+        return None
+
+    def _handle_existing_model_call(self, post: Post) -> Optional[ModelCall]:
+        """Check for existing pending/failed ModelCall records and handle them appropriately."""
+        # Check for any existing ModelCall with the same constraint values
+        existing_call = (
+            self.model_call_query.filter_by(
+                post_id=post.id,
+                first_segment_sequence_num=0,
+                last_segment_sequence_num=-1,
+                model_name=self.transcriber.model_name,
+            )
+            .order_by(ModelCall.timestamp.desc())
+            .first()
+        )
+
+        if existing_call:
+            if existing_call.status == "pending":
+                self.logger.info(
+                    f"Found existing pending ModelCall {existing_call.id} for post {post.id}. Reusing it."
+                )
+                # Reset retry attempts and update timestamp for this new attempt
+                existing_call.retry_attempts += 1
+                existing_call.timestamp = datetime.utcnow()
+                existing_call.error_message = None
+                self.db_session.commit()
+                return existing_call
+            elif existing_call.status in ["failed", "failed_permanent"]:
+                self.logger.info(
+                    f"Found existing failed ModelCall {existing_call.id} for post {post.id}. Updating to retry."
+                )
+                # Reset the failed call to pending for retry
+                existing_call.status = "pending"
+                existing_call.retry_attempts += 1
+                existing_call.timestamp = datetime.utcnow()
+                existing_call.error_message = None
+                self.db_session.commit()
+                return existing_call
+        
         return None
 
     def transcribe(self, post: Post) -> List[TranscriptSegment]:
@@ -119,21 +162,42 @@ class TranscriptionManager:
         if existing_segments is not None:
             return existing_segments
 
-        # Create a new ModelCall record for this transcription attempt
-        current_whisper_call = ModelCall(
-            post_id=post.id,
-            model_name=self.transcriber.model_name,
-            first_segment_sequence_num=0,  # Placeholder, will be updated
-            last_segment_sequence_num=-1,  # Placeholder, indicates no segments yet
-            prompt="Whisper transcription job",  # Standardized prompt for Whisper calls
-            status="pending",
-        )
-        self.db_session.add(current_whisper_call)
-        self.db_session.commit()  # Commit to get an ID for current_whisper_call if needed, and to mark it as pending
+        # Check for existing ModelCall records that might conflict with the unique constraint
+        current_whisper_call = self._handle_existing_model_call(post)
+        
+        if current_whisper_call is None:
+            # Create a new ModelCall record for this transcription attempt
+            try:
+                current_whisper_call = ModelCall(
+                    post_id=post.id,
+                    model_name=self.transcriber.model_name,
+                    first_segment_sequence_num=0,  # Placeholder, will be updated
+                    last_segment_sequence_num=-1,  # Placeholder, indicates no segments yet
+                    prompt="Whisper transcription job",  # Standardized prompt for Whisper calls
+                    status="pending",
+                )
+                self.db_session.add(current_whisper_call)
+                self.db_session.commit()  # Commit to get an ID for current_whisper_call if needed, and to mark it as pending
 
-        self.logger.info(
-            f"Created new Whisper ModelCall {current_whisper_call.id} for post {post.id}."
-        )
+                self.logger.info(
+                    f"Created new Whisper ModelCall {current_whisper_call.id} for post {post.id}."
+                )
+            except IntegrityError as e:
+                self.logger.warning(
+                    f"IntegrityError when creating ModelCall for post {post.id}: {e}. "
+                    f"Attempting to find and reuse existing record."
+                )
+                self.db_session.rollback()
+                
+                # Try one more time to find an existing record - this handles race conditions
+                current_whisper_call = self._handle_existing_model_call(post)
+                if current_whisper_call is None:
+                    # If we still can't find one, this is an unexpected error
+                    self.logger.error(
+                        f"Failed to create or find existing ModelCall for post {post.id} after IntegrityError. "
+                        f"This may indicate a database issue."
+                    )
+                    raise e
 
         try:
             self.logger.info(
